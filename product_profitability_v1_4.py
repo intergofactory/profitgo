@@ -1,228 +1,142 @@
 from __future__ import annotations
 
+import re
 import pandas as pd
 import streamlit as st
 
-
-PRODUCT_KEY_CANDIDATES = [
-    "Stok Kodu",
-    "Barkod",
-    "Model Kodu",
-    "Ürün Kodu",
-    "Ürün Adı",
-]
-PRODUCT_NAME_CANDIDATES = ["Ürün Adı", "Ürün", "Ürün İsmi", "Product Name"]
 STATUS_COL = "Sipariş Statüsü"
+ORDER_COL = "Sipariş No"
 QTY_COL = "Ürün Adedi"
-ORDER_AMOUNT_COL = "Sipariş Tutarı"
-NET_AMOUNT_COL = "Net Tutar"
-
-FEE_COLUMNS = {
+GROSS_COL = "Sipariş Tutarı"
+NET_COL = "Net Tutar"
+FEE_COLS = {
     "Komisyon": "Komisyon/Yurt Dışı Stok Destek Bedeli",
+    "İndirim": "İndirim",
     "Gönderi Kargo": "Gönderi Kargo Bedeli",
     "İade Kargo": "İade Kargo Bedeli",
-    "İndirim": "İndirim",
     "Platform": "Platform Hizmet Bedeli",
     "Ceza": "Ceza Bedeli",
-    "İade": "İade",
 }
 
 
-def _first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    return next((col for col in candidates if col in df.columns), None)
+def _num(s):
+    return pd.to_numeric(s, errors="coerce").fillna(0.0)
 
 
-def _numeric(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce").fillna(0.0)
+def money(v):
+    return f"{v:,.2f} TL".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def _money(value: float) -> str:
-    return f"{value:,.2f} TL".replace(",", "X").replace(".", ",").replace("X", ".")
+def _model_from_name(name: str) -> str:
+    text = str(name or "")
+    match = re.search(r"([A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*)\s*,\s*one size", text, flags=re.I)
+    if match:
+        return match.group(1).upper()
+    return ""
 
 
-def _prepare(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
-    key_col = _first_existing(df, PRODUCT_KEY_CANDIDATES)
-    name_col = _first_existing(df, PRODUCT_NAME_CANDIDATES)
-
-    if key_col is None:
-        raise ValueError(
-            "Ürün bazlı kârlılık için Stok Kodu, Barkod, Model Kodu, Ürün Kodu veya Ürün Adı sütunlarından biri gerekli."
-        )
-    if name_col is None:
-        name_col = key_col
-
-    work = df.copy()
-    work["_product_key"] = work[key_col].fillna("Tanımsız").astype(str).str.strip()
-    work["_product_name"] = work[name_col].fillna(work["_product_key"]).astype(str).str.strip()
-    work.loc[work["_product_key"].eq(""), "_product_key"] = "Tanımsız"
-
-    if STATUS_COL in work.columns:
-        work["_status"] = work[STATUS_COL].fillna("").astype(str).str.strip()
-    else:
-        work["_status"] = ""
-
-    for col in [QTY_COL, ORDER_AMOUNT_COL, NET_AMOUNT_COL, *FEE_COLUMNS.values()]:
-        if col in work.columns:
-            work[col] = _numeric(work[col])
-
-    return work, key_col, name_col
+def build_order_product_map(invoice_df: pd.DataFrame):
+    required = {ORDER_COL, "Ürün Adı"}
+    if not required.issubset(invoice_df.columns):
+        return {}, {}, 0
+    inv = invoice_df.copy()
+    if "İşlem Tipi" in inv.columns:
+        sale_mask = inv["İşlem Tipi"].fillna("").astype(str).str.strip().str.lower().isin(["satış", "yenilenmiş satış"])
+        inv = inv[sale_mask].copy()
+    inv["_order"] = inv[ORDER_COL].astype(str).str.replace(r"\.0$", "", regex=True)
+    inv["_model"] = inv["Ürün Adı"].map(_model_from_name)
+    inv = inv[inv["_model"].ne("")]
+    model_names = inv.groupby("_model")["Ürün Adı"].first().to_dict()
+    grouped = inv.groupby("_order")["_model"].agg(lambda x: sorted(set(x)))
+    mapping = {order: models[0] for order, models in grouped.items() if len(models) == 1}
+    multi_count = int((grouped.map(len) > 1).sum())
+    return mapping, model_names, multi_count
 
 
-def build_product_profitability(df: pd.DataFrame, costs: dict[str, float] | None = None) -> pd.DataFrame:
+def build_product_profitability(order_df: pd.DataFrame, invoice_df: pd.DataFrame, costs=None):
     costs = costs or {}
-    work, _, _ = _prepare(df)
+    if ORDER_COL not in order_df.columns:
+        raise ValueError("Sipariş Kayıtları dosyasında Sipariş No sütunu bulunamadı.")
+    mapping, model_names, multi_count = build_order_product_map(invoice_df)
+    if not mapping:
+        raise ValueError("Satıcı Fatura dosyalarından ürün-model eşleştirmesi oluşturulamadı.")
 
-    delivered_mask = work["_status"].eq("Teslim Edildi") if STATUS_COL in work.columns else pd.Series(True, index=work.index)
-    work["_delivered_units"] = 0.0
-    work["_delivered_revenue"] = 0.0
+    work = order_df.copy()
+    work["_order"] = work[ORDER_COL].astype(str).str.replace(r"\.0$", "", regex=True)
+    work["Model Kodu"] = work["_order"].map(mapping)
+    mapped = work[work["Model Kodu"].notna()].copy()
+    if mapped.empty:
+        raise ValueError("Siparişler ile Satıcı Fatura kayıtları eşleşmedi.")
 
-    if QTY_COL in work.columns:
-        work.loc[delivered_mask, "_delivered_units"] = work.loc[delivered_mask, QTY_COL]
-    else:
-        work.loc[delivered_mask, "_delivered_units"] = 1.0
+    for col in [QTY_COL, GROSS_COL, NET_COL, *FEE_COLS.values()]:
+        if col in mapped.columns:
+            mapped[col] = _num(mapped[col])
+    delivered = mapped[mapped[STATUS_COL].astype(str).str.strip().eq("Teslim Edildi")].copy() if STATUS_COL in mapped.columns else mapped
 
-    if ORDER_AMOUNT_COL in work.columns:
-        work.loc[delivered_mask, "_delivered_revenue"] = work.loc[delivered_mask, ORDER_AMOUNT_COL]
-
-    rows: list[dict] = []
-    for product_key, group in work.groupby("_product_key", dropna=False):
-        product_name = group["_product_name"].replace("", pd.NA).dropna()
-        product_name_value = product_name.iloc[0] if not product_name.empty else str(product_key)
-
-        delivered_units = float(group["_delivered_units"].sum())
-        delivered_revenue = float(group["_delivered_revenue"].sum())
-        financial_net = float(group[NET_AMOUNT_COL].sum()) if NET_AMOUNT_COL in group.columns else 0.0
-        unit_cost = float(costs.get(str(product_key), 0.0) or 0.0)
-        product_cost = delivered_units * unit_cost
-        profit = financial_net - product_cost
-        margin = (profit / delivered_revenue * 100.0) if delivered_revenue > 0 else 0.0
-
-        fee_values = {}
-        for label, col in FEE_COLUMNS.items():
-            fee_values[label] = abs(float(group[col].sum())) if col in group.columns else 0.0
-
-        if unit_cost <= 0:
-            health = "⚪ Maliyet Eksik"
-        elif profit < 0:
-            health = "🔴 Zarar"
-        elif margin < 10:
-            health = "🟠 Düşük Marj"
-        else:
-            health = "🟢 Sağlıklı"
-
-        rows.append({
-            "Ürün Anahtarı": str(product_key),
-            "Ürün": product_name_value,
-            "Teslim Adet": delivered_units,
-            "Teslim Ciro": delivered_revenue,
-            "Trendyol Net": financial_net,
-            "Birim Maliyet": unit_cost,
-            "Ürün Maliyeti": product_cost,
-            "Gerçek Kâr": profit,
-            "Kâr Marjı %": margin,
-            "Durum": health,
-            **fee_values,
-        })
-
+    rows = []
+    for model, group in delivered.groupby("Model Kodu"):
+        qty = float(group[QTY_COL].sum()) if QTY_COL in group else float(len(group))
+        gross = float(group[GROSS_COL].sum()) if GROSS_COL in group else 0.0
+        net = float(group[NET_COL].sum()) if NET_COL in group else 0.0
+        cost = float(costs.get(str(model), 0.0) or 0.0)
+        cogs = qty * cost
+        profit = net - cogs
+        margin = profit / gross * 100 if gross else 0.0
+        status = "⚪ Maliyet Eksik" if cost <= 0 else ("🔴 Zarar" if profit < 0 else ("🟠 Düşük Marj" if margin < 10 else "🟢 Sağlıklı"))
+        row = {"Model Kodu": model, "Ürün": model_names.get(model, model), "Sipariş": len(group), "Teslim Adet": qty,
+               "Teslim Ciro": gross, "Trendyol Net": net, "Birim Maliyet": cost, "Ürün Maliyeti": cogs,
+               "Gerçek Kâr": profit, "Kâr Marjı %": margin, "Durum": status}
+        for label, col in FEE_COLS.items():
+            row[label] = abs(float(group[col].sum())) if col in group else 0.0
+        rows.append(row)
     result = pd.DataFrame(rows)
-    if result.empty:
-        return result
+    if not result.empty:
+        rank = {"🔴 Zarar": 0, "🟠 Düşük Marj": 1, "⚪ Maliyet Eksik": 2, "🟢 Sağlıklı": 3}
+        result["_rank"] = result["Durum"].map(rank).fillna(9)
+        result = result.sort_values(["_rank", "Gerçek Kâr"]).drop(columns="_rank").reset_index(drop=True)
+    stats = {"mapped_orders": mapped["_order"].nunique(), "total_orders": work["_order"].nunique(), "multi_product_orders": multi_count,
+             "unmapped_orders": work.loc[work["Model Kodu"].isna(), "_order"].nunique()}
+    return result, stats
 
-    rank = {"🔴 Zarar": 0, "🟠 Düşük Marj": 1, "⚪ Maliyet Eksik": 2, "🟢 Sağlıklı": 3}
-    result["_rank"] = result["Durum"].map(rank).fillna(9)
-    return result.sort_values(["_rank", "Gerçek Kâr"], ascending=[True, True]).drop(columns="_rank").reset_index(drop=True)
 
-
-def render_product_profitability_v14(df: pd.DataFrame) -> None:
-    st.markdown(
-        '<div class="pg-card"><div class="pg-eyebrow">V1.4 • KÂRLILIK MERKEZİ</div>'
-        '<h3>Hangi üründen gerçekten ne kadar kazanıyorsun?</h3>'
-        '<p>ProfitGO, Trendyol Net Tutarını ürün maliyetiyle birleştirir. Komisyon, kargo, indirim, iade ve cezaların finansal etkisi Trendyol netinde korunur.</p></div>',
-        unsafe_allow_html=True,
-    )
-
-    try:
-        work, key_col, _ = _prepare(df)
-    except ValueError as exc:
-        st.warning(str(exc))
-        return
-
+def render_product_profitability_v14(order_df: pd.DataFrame, invoice_df: pd.DataFrame) -> None:
+    st.markdown('<div class="pg-card"><div class="pg-eyebrow">V1.4 • KÂRLILIK MERKEZİ</div><h3>Hangi üründen gerçekten ne kadar kazanıyorsun?</h3><p>Sipariş Kayıtları finansal hareketleri, Satıcı Fatura dosyalarındaki ürün/model bilgisiyle eşleştirilir. Böylece sipariş raporunda ürün sütunu olmasa bile ürün bazlı kârlılık hesaplanır.</p></div>', unsafe_allow_html=True)
     if "pg_product_costs_v14" not in st.session_state:
         st.session_state.pg_product_costs_v14 = {}
+    try:
+        preview, stats = build_product_profitability(order_df, invoice_df, st.session_state.pg_product_costs_v14)
+    except ValueError as exc:
+        st.warning(str(exc)); return
+    if preview.empty:
+        st.info("Kârlılık tablosu oluşturulamadı."); return
 
-    products = (
-        work[["_product_key", "_product_name"]]
-        .drop_duplicates("_product_key")
-        .sort_values("_product_name")
-        .reset_index(drop=True)
-    )
-    products["Birim Maliyet (TL)"] = products["_product_key"].map(st.session_state.pg_product_costs_v14).fillna(0.0)
-    cost_editor = products.rename(columns={"_product_key": "Ürün Anahtarı", "_product_name": "Ürün"})
-
+    st.caption(f"{stats['mapped_orders']:,} sipariş ürün modeliyle eşleşti • {stats['multi_product_orders']} çok ürünlü sipariş güvenli hesap için ürün tablosundan hariç tutuldu • {stats['unmapped_orders']} sipariş eşleşmedi".replace(",", "."))
+    cost_table = preview[["Model Kodu", "Ürün"]].drop_duplicates().copy()
+    cost_table["Birim Maliyet (TL)"] = cost_table["Model Kodu"].map(st.session_state.pg_product_costs_v14).fillna(0.0)
     with st.expander("Ürün maliyetlerini gir / güncelle", expanded=True):
-        st.caption(f"Eşleştirme alanı: {key_col}. Maliyetler bu demo oturumu boyunca saklanır.")
-        edited = st.data_editor(
-            cost_editor,
-            width="stretch",
-            hide_index=True,
-            disabled=["Ürün Anahtarı", "Ürün"],
-            column_config={
-                "Birim Maliyet (TL)": st.column_config.NumberColumn(min_value=0.0, step=1.0, format="%.2f"),
-            },
-            key="pg_cost_editor_v14",
-        )
+        edited = st.data_editor(cost_table, width="stretch", hide_index=True, disabled=["Model Kodu", "Ürün"],
+            column_config={"Birim Maliyet (TL)": st.column_config.NumberColumn(min_value=0.0, step=1.0, format="%.2f")}, key="pg_cost_editor_v14")
         if st.button("Maliyetleri uygula", type="primary", key="pg_apply_costs_v14"):
-            st.session_state.pg_product_costs_v14 = {
-                str(row["Ürün Anahtarı"]): float(row["Birim Maliyet (TL)"] or 0.0)
-                for _, row in edited.iterrows()
-            }
-            st.success("Ürün maliyetleri kârlılık hesabına uygulandı.")
+            st.session_state.pg_product_costs_v14 = {str(r["Model Kodu"]): float(r["Birim Maliyet (TL)"] or 0) for _, r in edited.iterrows()}
             st.rerun()
 
-    result = build_product_profitability(df, st.session_state.pg_product_costs_v14)
-    if result.empty:
-        st.info("Ürün bazlı analiz oluşturulamadı.")
-        return
+    result, stats = build_product_profitability(order_df, invoice_df, st.session_state.pg_product_costs_v14)
+    total_gross = float(result["Teslim Ciro"].sum()); total_net = float(result["Trendyol Net"].sum()); total_cogs = float(result["Ürün Maliyeti"].sum()); total_profit = float(result["Gerçek Kâr"].sum())
+    margin = total_profit / total_gross * 100 if total_gross else 0
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Eşleşen Ciro", money(total_gross)); c2.metric("Trendyol Net", money(total_net)); c3.metric("Ürün Maliyeti", money(total_cogs)); c4.metric("Gerçek Kâr", money(total_profit), f"%{margin:.1f} marj")
 
-    total_revenue = float(result["Teslim Ciro"].sum())
-    total_net = float(result["Trendyol Net"].sum())
-    total_cost = float(result["Ürün Maliyeti"].sum())
-    total_profit = float(result["Gerçek Kâr"].sum())
-    total_margin = (total_profit / total_revenue * 100.0) if total_revenue > 0 else 0.0
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Teslim Edilen Ciro", _money(total_revenue))
-    c2.metric("Trendyol Net", _money(total_net))
-    c3.metric("Ürün Maliyeti", _money(total_cost))
-    c4.metric("Gerçek Kâr", _money(total_profit), f"%{total_margin:.1f} marj")
-
-    losing = int(result["Durum"].eq("🔴 Zarar").sum())
-    low_margin = int(result["Durum"].eq("🟠 Düşük Marj").sum())
-    missing_cost = int(result["Durum"].eq("⚪ Maliyet Eksik").sum())
-
-    if losing:
-        st.error(f"{losing} ürün zarar ediyor. Öncelikli fiyat/maliyet kontrolü öneriliyor.")
-    elif low_margin:
-        st.warning(f"{low_margin} ürünün kâr marjı %10'un altında.")
-    elif missing_cost:
-        st.info(f"{missing_cost} ürün için maliyet girildiğinde gerçek kâr hesabı tamamlanacak.")
-    else:
-        st.success("Maliyeti tanımlı ürünlerde zarar veya düşük marj alarmı yok.")
+    losing = int(result["Durum"].eq("🔴 Zarar").sum()); low = int(result["Durum"].eq("🟠 Düşük Marj").sum()); missing = int(result["Durum"].eq("⚪ Maliyet Eksik").sum())
+    if losing: st.error(f"{losing} ürün modeli zarar ediyor.")
+    elif low: st.warning(f"{low} ürün modelinin marjı %10'un altında.")
+    elif missing: st.info(f"{missing} ürün modeli için maliyet girilmesi gerekiyor.")
+    else: st.success("Maliyeti tanımlı ürünlerde kârlılık alarmı yok.")
 
     display = result.copy()
-    money_cols = [
-        "Teslim Ciro", "Trendyol Net", "Birim Maliyet", "Ürün Maliyeti", "Gerçek Kâr",
-        "Komisyon", "Gönderi Kargo", "İade Kargo", "İndirim", "Platform", "Ceza", "İade",
-    ]
-    for col in money_cols:
-        if col in display.columns:
-            display[col] = display[col].map(_money)
+    for col in ["Teslim Ciro","Trendyol Net","Birim Maliyet","Ürün Maliyeti","Gerçek Kâr",*FEE_COLS.keys()]:
+        if col in display: display[col] = display[col].map(money)
     display["Teslim Adet"] = display["Teslim Adet"].round(0).astype(int)
     display["Kâr Marjı %"] = display["Kâr Marjı %"].map(lambda x: f"%{x:.1f}")
-
     st.write("### Ürün Kârlılık Tablosu")
     st.dataframe(display, width="stretch", hide_index=True)
-
-    st.caption(
-        "V1.4 hesap mantığı: ürün finansal neti = Trendyol raporundaki Net Tutar toplamı; gerçek kâr = ürün finansal neti − teslim edilen adet × birim maliyet."
-    )
+    st.caption("Hesap: Gerçek Kâr = Trendyol Net Tutar − (Teslim Edilen Adet × Birim Maliyet). Çok ürünlü siparişler yanlış maliyet dağıtımı yapmamak için bu sürümde hariç tutulur.")
