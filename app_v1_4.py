@@ -1,20 +1,17 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+import importlib
 
 import pandas as pd
 import streamlit as st
+import trendyol_api_v1_4 as ty
 
-from trendyol_api_v1_4 import (
-    TrendyolCredentials,
-    TrendyolApiError,
-    fetch_order_packages,
-    packages_to_lines,
-    fetch_settlements,
-    fetch_other_financials,
-    settlement_summary,
-    other_financial_summary,
-)
+# Streamlit Community Cloud can keep an already-imported module in memory across
+# rapid branch deploys. Reload it so the UI and API layer always use the same commit.
+ty = importlib.reload(ty)
+TrendyolCredentials = ty.TrendyolCredentials
+TrendyolApiError = ty.TrendyolApiError
 
 st.set_page_config(page_title="ProfitGO V1.4 - API Finans Merkezi", page_icon="◈", layout="wide", initial_sidebar_state="expanded")
 
@@ -73,14 +70,14 @@ if (end_date - start_date).days > 14:
 if st.button("Trendyol'dan sipariş + finans verilerini çek", type="primary", width="stretch"):
     try:
         with st.spinner("1/3 Siparişler Trendyol Order V2 API'den alınıyor..."):
-            packages = fetch_order_packages(creds, start_date, end_date)
-            lines = packages_to_lines(packages)
+            packages = ty.fetch_order_packages(creds, start_date, end_date)
+            lines = ty.packages_to_lines(packages)
 
         with st.spinner("2/3 Gerçek komisyon ve cari hesap hareketleri alınıyor..."):
-            settlements = fetch_settlements(creds, start_date, end_date)
+            settlements = ty.fetch_settlements(creds, start_date, end_date)
 
         with st.spinner("3/3 Trendyol hizmet/kesinti faturaları alınıyor..."):
-            deductions = fetch_other_financials(creds, start_date, end_date, transaction_type="DeductionInvoices")
+            deductions = ty.fetch_other_financials(creds, start_date, end_date, transaction_type="DeductionInvoices")
 
         st.session_state.v14_api_packages = packages
         st.session_state.v14_api_lines = lines
@@ -93,6 +90,8 @@ if st.button("Trendyol'dan sipariş + finans verilerini çek", type="primary", w
         )
     except TrendyolApiError as exc:
         st.error(str(exc))
+    except Exception as exc:
+        st.error(f"Beklenmeyen entegrasyon hatası: {type(exc).__name__}: {exc}")
 
 if "v14_api_lines" not in st.session_state:
     st.info("Tarih aralığını seç ve canlı sipariş + finans verilerini getir.")
@@ -111,8 +110,8 @@ seller_discount = float(pd.to_numeric(lines["Satıcı İndirimi"], errors="coerc
 ty_discount = float(pd.to_numeric(lines["Trendyol İndirimi"], errors="coerce").fillna(0).sum())
 estimated_commission = float(pd.to_numeric(lines["Tahmini Komisyon"], errors="coerce").fillna(0).sum())
 
-fin = settlement_summary(settlements)
-ded = other_financial_summary(deductions)
+fin = ty.settlement_summary(settlements)
+ded = ty.other_financial_summary(deductions)
 actual_commission = fin["commission_net"]
 commission_diff = actual_commission - estimated_commission
 commission_diff_pct = (commission_diff / estimated_commission * 100.0) if estimated_commission else 0.0
