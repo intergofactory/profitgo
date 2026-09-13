@@ -48,16 +48,14 @@ def fetch_settlements_by_payment_order(creds,payment_order_id,transaction_types=
    if typ in {'Sale','Return'} or '400' not in str(exc):raise
  return pd.DataFrame(rows)
 
-# Official domestic Other Financials transaction types. PaymentOrder is fetched for
-# traceability but excluded from the pre-payment balance by the payout auditor.
-OTHER_FINANCIAL_TYPES=('PaymentOrder','DeductionInvoices','CreditNote','CommissionInvoice')
+# Trendyol domestic API enum is intentionally spelled "CommissionInvocie" in
+# the official reference. Do not correct the provider's spelling here.
+OTHER_FINANCIAL_TYPES=('PaymentOrder','DeductionInvoices','CreditNote','CommissionInvocie')
 def fetch_other_financials_by_payment_order(creds,payment_order_id,transaction_types=OTHER_FINANCIAL_TYPES):
  rows=[];path=f'/integration/finance/che/sellers/{creds.seller_id}/otherfinancials'
  for typ in transaction_types:
   try:rows.extend(_paged_content(creds,path,{'paymentOrderId':int(payment_order_id),'transactionType':typ},size=1000,source_type=typ))
   except TrendyolApiError as exc:
-   # Some Trendyol tenants intermittently return 500 for an empty subtype. Keep
-   # the audit alive and expose whichever official ledgers are available.
    if '400' not in str(exc) and '500' not in str(exc):raise
  return pd.DataFrame(rows)
 
