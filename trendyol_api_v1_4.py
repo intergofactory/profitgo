@@ -45,21 +45,20 @@ def fetch_settlements_by_payment_order(creds,payment_order_id,transaction_types=
  for typ in transaction_types:
   try:rows.extend(_paged_content(creds,path,{'paymentOrderId':int(payment_order_id),'transactionType':typ},size=1000,source_type=typ))
   except TrendyolApiError as exc:
-   if typ in {'Sale','Return'} or ('401' in str(exc) or '429' in str(exc)):raise
+   if typ in {'Sale','Return'} or '400' not in str(exc):raise
  return pd.DataFrame(rows)
 
-# Domestic CHE docs expose PaymentOrder, DeductionInvoices, CreditNote and CommissionInvoice.
-# PaymentOrder is deliberately excluded here: its amount is the payout being audited and
-# adding it to expected current-account effects would double count the payment itself.
-OTHER_FINANCIAL_TYPES=('DeductionInvoices','CreditNote','CommissionInvoice')
+# Official domestic Other Financials transaction types. PaymentOrder is fetched for
+# traceability but excluded from the pre-payment balance by the payout auditor.
+OTHER_FINANCIAL_TYPES=('PaymentOrder','DeductionInvoices','CreditNote','CommissionInvoice')
 def fetch_other_financials_by_payment_order(creds,payment_order_id,transaction_types=OTHER_FINANCIAL_TYPES):
  rows=[];path=f'/integration/finance/che/sellers/{creds.seller_id}/otherfinancials'
  for typ in transaction_types:
   try:rows.extend(_paged_content(creds,path,{'paymentOrderId':int(payment_order_id),'transactionType':typ},size=1000,source_type=typ))
   except TrendyolApiError as exc:
-   # Trendyol occasionally returns 500 for an optional type with no compatible records.
-   # Never let that hide valid Sale/Return settlement reconciliation.
-   if '401' in str(exc) or '429' in str(exc):raise
+   # Some Trendyol tenants intermittently return 500 for an empty subtype. Keep
+   # the audit alive and expose whichever official ledgers are available.
+   if '400' not in str(exc) and '500' not in str(exc):raise
  return pd.DataFrame(rows)
 
 def fetch_order_packages(creds,start_date,end_date,status=None):
