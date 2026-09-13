@@ -52,20 +52,19 @@ ded=ty.other_financial_summary(deductions); pf=ty.other_financial_summary(platfo
 st.markdown('<div class="pg"><b>KOMİSYON DENETÇİSİ • MUTABIK</b><h3>Brüt matrah kontrolü</h3></div>',unsafe_allow_html=True)
 a1,a2,a3,a4=st.columns(4);a1.metric('Brüt Bazda Beklenen',money(sm['expected']));a2.metric('Finance Gerçek Net',money(sm['actual']));a3.metric('Pozitif Fark Adayı',money(sm['positive']));a4.metric('Avantaj / Düzeltme',money(sm['negative']))
 
-# Cost master: user-editable, session-persistent. C Sehpa reference cost prefilled only for model TKRCSHP01.
 models=lines[['Model Kodu','Barkod','Ürün Adı']].drop_duplicates().copy(); models['Birim Maliyet (KDV Dahil)']=0.0
-models.loc[models['Model Kodu'].eq('TKRCSHP01'),'Birim Maliyet (KDV Dahil)']=370.0
+reference_costs={'TKRCSHP01':370.0,'CT1.B':300.0}
+for model,cost in reference_costs.items():models.loc[models['Model Kodu'].eq(model),'Birim Maliyet (KDV Dahil)']=cost
 if 'v14_cost_master' in st.session_state:
  old=st.session_state.v14_cost_master
  if isinstance(old,pd.DataFrame) and not old.empty:
-  models=models.drop(columns=['Birim Maliyet (KDV Dahil)']).merge(old[['Model Kodu','Birim Maliyet (KDV Dahil)']].drop_duplicates('Model Kodu'),on='Model Kodu',how='left'); models['Birim Maliyet (KDV Dahil)']=pd.to_numeric(models['Birim Maliyet (KDV Dahil)'],errors='coerce').fillna(0)
-st.markdown('<div class="pg"><b>MALİYET MERKEZİ</b><h3>SKU birim maliyetlerini gir</h3><p>C Sehpa (TKRCSHP01) 370 TL KDV dahil referans maliyetle hazır. Diğer SKU maliyetlerini tabloda düzenleyebilirsin.</p></div>',unsafe_allow_html=True)
+  saved=old[['Model Kodu','Birim Maliyet (KDV Dahil)']].drop_duplicates('Model Kodu').rename(columns={'Birim Maliyet (KDV Dahil)':'Kayitli Maliyet'})
+  models=models.merge(saved,on='Model Kodu',how='left'); models['Birim Maliyet (KDV Dahil)']=pd.to_numeric(models['Kayitli Maliyet'],errors='coerce').combine_first(models['Birim Maliyet (KDV Dahil)']); models=models.drop(columns=['Kayitli Maliyet'])
+st.markdown('<div class="pg"><b>MALİYET MERKEZİ</b><h3>SKU birim maliyetlerini gir</h3><p>CT1.B Beyaz Tekerlekli C Sehpa: 300 TL KDV dahil. Maliyetler oturum boyunca korunur ve SKU kârlılığına otomatik bağlanır.</p></div>',unsafe_allow_html=True)
 edited=st.data_editor(models,width='stretch',hide_index=True,disabled=['Model Kodu','Barkod','Ürün Adı'],column_config={'Birim Maliyet (KDV Dahil)':st.column_config.NumberColumn(min_value=0.0,step=1.0,format='%.2f TL')},key='cost_editor')
 st.session_state.v14_cost_master=edited.copy(); costs={str(r['Model Kodu']):float(r['Birim Maliyet (KDV Dahil)'] or 0) for _,r in edited.iterrows()}
 
-# Shared costs: exclude commission invoice (already in settlements) and cargo (direct), allocate remaining operational expenses by revenue.
-ad=cat(dmap,'Reklam / Pazarlama'); finance=cat(dmap,'Erken Ödeme / Finansman'); comp=cat(dmap,'Tazmin / Ürün Kaynaklı'); penalty=cat(dmap,'Ceza / İhlal'); unknown=cat(dmap,'Diğer / Tanımsız Fatura')
-shared=ad+finance+comp+penalty+unknown
+ad=cat(dmap,'Reklam / Pazarlama'); finance=cat(dmap,'Erken Ödeme / Finansman'); comp=cat(dmap,'Tazmin / Ürün Kaynaklı'); penalty=cat(dmap,'Ceza / İhlal'); unknown=cat(dmap,'Diğer / Tanımsız Fatura'); shared=ad+finance+comp+penalty+unknown
 profit=pp.build(lines,settlements,cargo,platform_total=pf['net_deduction'],shared_operational_total=shared,costs=costs); ps=pp.summary(profit)
 st.markdown('<div class="pg"><b>GERÇEK ÜRÜN KÂRLILIĞI</b><h3>SKU bazında gerçekleşmiş sonuç</h3><p>Kargo siparişe doğrudan bağlanır. Komisyon Finance hareketinden gelir. Platform ve doğrudan SKU bağı olmayan operasyonel giderler satış geliri oranında dağıtılır. Komisyon faturası ikinci kez gider yazılmaz.</p></div>',unsafe_allow_html=True)
 p1,p2,p3,p4=st.columns(4);p1.metric('Maliyeti Girilmiş SKU',ps['costed_skus']);p2.metric('Gerçek Net Kâr',money(ps['profit']));p3.metric('Net Kâr Marjı',f"%{ps['margin']:.2f}");p4.metric('Zarar Eden SKU',ps['loss_skus'])
@@ -73,11 +72,8 @@ if ps['missing_skus']:st.warning(f"{ps['missing_skus']} SKU için ürün maliyet
 else:st.success('Tüm SKU maliyetleri mevcut; ürün kârlılığı tam hesaplanıyor.')
 cols=['Model Kodu','Barkod','Ürün Adı','Adet','Satış','Gerçek_Komisyon','Kargo','Platform Payı','Reklam/Diğer Payı','Birim Maliyet','Ürün Maliyeti','Gerçek Net Kâr','Net Marj %','Kârlılık']
 st.dataframe(profit[[c for c in cols if c in profit]],width='stretch',hide_index=True,column_config={c:st.column_config.NumberColumn(format='%.2f TL') for c in ['Satış','Gerçek_Komisyon','Kargo','Platform Payı','Reklam/Diğer Payı','Birim Maliyet','Ürün Maliyeti','Gerçek Net Kâr']}|{'Net Marj %':st.column_config.NumberColumn(format='%.2f%%')})
-
-with st.expander('Kesinti haritası'):
- st.dataframe(dmap,width='stretch',hide_index=True)
-with st.expander('Brüt matrah komisyon denetçisi'):
- st.dataframe(audit,width='stretch',hide_index=True)
+with st.expander('Kesinti haritası'):st.dataframe(dmap,width='stretch',hide_index=True)
+with st.expander('Brüt matrah komisyon denetçisi'):st.dataframe(audit,width='stretch',hide_index=True)
 with st.expander('Kargo detayları'):
  if not cargo.empty:st.dataframe(cargo,width='stretch',hide_index=True)
  else:st.info('Kargo detayı yok.')
