@@ -28,17 +28,21 @@ choice=st.selectbox('Denetlenecek hakediş',orders['Etiket'].tolist(),index=0);p
 if st.button('Bu hakedişi kuruşu kuruşuna denetle',type='primary',width='stretch'):
  try:
   with st.spinner('paymentOrderId içindeki tüm finans hareketleri mutabık ediliyor...'):
-   s=ty.fetch_settlements_by_payment_order(creds,po['id']);o=ty.fetch_other_financials_by_payment_order(creds,po['id']);result=pa.audit(po,s,o);st.session_state.v14_payout_audit=result
+   s=ty.fetch_settlements_by_payment_order(creds,po['id']);o=ty.fetch_other_financials_by_payment_order(creds,po['id']);st.session_state.v14_payout_audit=pa.audit(po,s,o)
  except Exception as e:st.error(f'Hakediş denetimi tamamlanamadı: {e}')
 r=st.session_state.get('v14_payout_audit')
 if not r or str(r.get('paymentOrderId'))!=str(po.get('id')):st.stop()
 st.markdown('<div class="pg"><b>HAKEDİŞ MUTABAKATI</b><h3>Payment Order '+str(r['paymentOrderId'])+' • '+dt(r['payoutDate'])+'</h3></div>',unsafe_allow_html=True)
 a,b,c,d=st.columns(4);a.metric('Hesaplanan Hakediş',money(r['expected']));b.metric("Trendyol'un Ödediği",money(r['paid']));c.metric('Fark',money(r['difference']));d.metric('Durum',r['status'])
-if abs(r['difference'])<=0.05:st.success('Hakediş kuruş toleransı içinde mutabık. Trendyol ödeme emri ile ProfitGO hesabı eşleşiyor.')
-else:st.warning(f"Bu hakedişte {money(abs(r['difference']))} mutabakat farkı var. Aşağıdaki hareketlerden kaynağını ayıracağız.")
+if abs(r['difference'])<=0.05:st.success('Hakediş kuruş toleransı içinde mutabık.')
+else:st.warning(f"Bu hakedişte {money(abs(r['difference']))} mutabakat farkı var. Aşağıdaki tür kırılımı farkın kaynağını izole eder.")
 e,f=st.columns(2);e.metric('Settlement Etkisi',money(r['settlement_effect']));f.metric('Diğer Finansal Etki',money(r['other_effect']))
-with st.expander('Satış / iade / indirim / komisyon düzeltmeleri',expanded=abs(r['difference'])>0.05):
+st.subheader('Settlement tür kırılımı')
+sby=r.get('settlement_by_type',pd.DataFrame());st.dataframe(sby,width='stretch',hide_index=True)
+st.subheader('Diğer finans tür kırılımı')
+oby=r.get('other_by_type',pd.DataFrame());st.dataframe(oby,width='stretch',hide_index=True)
+with st.expander('Satış / iade / indirim / komisyon düzeltmeleri'):
  sr=r['settlement_rows'];cols=[c for c in ['Tür','transactionDate','orderNumber','barcode','sellerRevenue','commissionAmount','debt','credit','Etki','description'] if c in sr.columns];st.dataframe(sr[cols] if cols else sr,width='stretch',hide_index=True)
-with st.expander('Kesinti / fatura / diğer finans hareketleri',expanded=abs(r['difference'])>0.05):
+with st.expander('Kesinti / fatura / diğer finans hareketleri'):
  orows=r['other_rows'];cols=[c for c in ['Tür','transactionDate','transactionType','transactionSubType','description','debt','credit','Etki','id'] if c in orows.columns];st.dataframe(orows[cols] if cols else orows,width='stretch',hide_index=True)
 st.caption('Ürün kârlılığı V1.4 içinde korunuyor ancak hakediş mutabakatı tamamlanana kadar ana ekrandan ikinci plana alındı.')
