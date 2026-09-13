@@ -57,10 +57,14 @@ def fetch_order_packages(creds,start_date,end_date,status=None):
 def packages_to_lines(packages):
     rows=[]
     for package in packages:
-        order=str(package.get("orderNumber") or ""); pid=package.get("shipmentPackageId") or package.get("id"); status=package.get("status") or package.get("shipmentPackageStatus") or ""; od=package.get("orderDate") or package.get("createdDate") or package.get("packageLastModifiedDate")
+        order=str(package.get("orderNumber") or "")
+        pid=package.get("shipmentPackageId") or package.get("id")
+        status=package.get("status") or package.get("shipmentPackageStatus") or ""
+        od=package.get("orderDate") or package.get("createdDate") or package.get("packageLastModifiedDate")
+        discount_names=", ".join(str(x.get("displayName") or "") for x in (package.get("discountDisplays") or []) if x.get("displayName"))
         for line in package.get("lines") or []:
             q=float(line.get("quantity") or 0); gross=float(line.get("lineGrossAmount") or line.get("price") or 0); unit=float(line.get("lineUnitPrice") or line.get("price") or 0); sd=float(line.get("lineSellerDiscount") or 0); td=float(line.get("lineTyDiscount") or 0); cr=float(line.get("commission") or line.get("commissionRate") or 0); vat=float(line.get("vatRate") or 0)
-            rows.append({"Sipariş No":order,"Paket ID":pid,"Sipariş Tarihi":od,"Sipariş Statüsü":status,"Model Kodu":str(line.get("stockCode") or line.get("merchantSku") or "").strip(),"Barkod":str(line.get("barcode") or "").strip(),"Ürün Adı":str(line.get("productName") or "").strip(),"Ürün Adedi":q,"Birim Brüt Fiyat":gross,"Birim Net Fiyat":unit,"Teslim Ciro":unit*q,"Satıcı İndirimi":sd*q,"Trendyol İndirimi":td*q,"Komisyon Oranı %":cr,"Tahmini Komisyon":unit*q*cr/100,"KDV Oranı %":vat,"Line ID":line.get("lineId")})
+            rows.append({"Sipariş No":order,"Paket ID":pid,"Sipariş Tarihi":od,"Sipariş Statüsü":status,"Model Kodu":str(line.get("stockCode") or line.get("merchantSku") or "").strip(),"Barkod":str(line.get("barcode") or "").strip(),"Ürün Adı":str(line.get("productName") or "").strip(),"Ürün Adedi":q,"Birim Brüt Fiyat":gross,"Birim Net Fiyat":unit,"Teslim Ciro":unit*q,"Satıcı İndirimi":sd*q,"Trendyol İndirimi":td*q,"Sipariş Komisyon Oranı %":cr,"Tahmini Komisyon":unit*q*cr/100,"KDV Oranı %":vat,"Line ID":line.get("lineId"),"Satış Kampanyası ID":line.get("salesCampaignId"),"İndirim Kampanyaları":discount_names})
     return pd.DataFrame(rows)
 
 SETTLEMENT_TYPES=("Sale","Return","Discount","DiscountCancel","Coupon","CouponCancel","ProvisionPositive","ProvisionNegative","SellerRevenuePositive","SellerRevenueNegative","CommissionPositive","CommissionNegative","SellerRevenuePositiveCancel","SellerRevenueNegativeCancel","CommissionPositiveCancel","CommissionNegativeCancel")
@@ -81,28 +85,62 @@ def fetch_other_financials(creds,start_date,end_date,transaction_type="Deduction
     return pd.DataFrame(_paged_content(creds,f"/integration/finance/che/sellers/{creds.seller_id}/otherfinancials",p,size=1000,source_type=transaction_type))
 
 def settlement_summary(df):
-    if df.empty: return {"seller_revenue_net":0.,"commission_net":0.,"sales_revenue":0.,"return_revenue":0.,"sale_commission":0.,"return_commission":0.}
+    if df.empty: return {"seller_revenue_net":0.,"commission_net":0.,"sales_revenue":0.,"return_revenue":0.,"sale_commission":0.,"return_commission":0.,"commission_credit":0.,"commission_debit":0.}
     w=df.copy()
     for c in ("sellerRevenue","commissionAmount","debt","credit"):
         if c not in w: w[c]=0.
         w[c]=pd.to_numeric(w[c],errors="coerce").fillna(0.)
     s=w.get("_sourceTransactionType",pd.Series("",index=w.index)).astype(str)
     sale=float(w.loc[s.eq("Sale"),"commissionAmount"].abs().sum()); ret=float(w.loc[s.eq("Return"),"commissionAmount"].abs().sum())
-    return {"seller_revenue_net":float(w.loc[s.eq("Sale"),"sellerRevenue"].abs().sum()-w.loc[s.eq("Return"),"sellerRevenue"].abs().sum()),"commission_net":sale-ret,"sales_revenue":float(w.loc[s.eq("Sale"),"sellerRevenue"].abs().sum()),"return_revenue":float(w.loc[s.eq("Return"),"sellerRevenue"].abs().sum()),"sale_commission":sale,"return_commission":ret}
+    cneg=float(w.loc[s.eq("CommissionNegative"),"commissionAmount"].abs().sum()); cpos=float(w.loc[s.eq("CommissionPositive"),"commissionAmount"].abs().sum())
+    cneg_cancel=float(w.loc[s.eq("CommissionNegativeCancel"),"commissionAmount"].abs().sum()); cpos_cancel=float(w.loc[s.eq("CommissionPositiveCancel"),"commissionAmount"].abs().sum())
+    net_commission=sale-ret-cneg+cpos+cneg_cancel-cpos_cancel
+    return {"seller_revenue_net":float(w.loc[s.eq("Sale"),"sellerRevenue"].abs().sum()-w.loc[s.eq("Return"),"sellerRevenue"].abs().sum()),"commission_net":net_commission,"sales_revenue":float(w.loc[s.eq("Sale"),"sellerRevenue"].abs().sum()),"return_revenue":float(w.loc[s.eq("Return"),"sellerRevenue"].abs().sum()),"sale_commission":sale,"return_commission":ret,"commission_credit":cneg-cneg_cancel,"commission_debit":cpos-cpos_cancel}
+
+def _weighted_rate(group: pd.DataFrame, amount_col: str="commissionAmount") -> float:
+    if "commissionRate" not in group.columns or group.empty: return 0.0
+    rates=pd.to_numeric(group["commissionRate"],errors="coerce")
+    amounts=pd.to_numeric(group.get(amount_col,0.),errors="coerce").abs().fillna(0.)
+    mask=rates.notna() & (rates>0)
+    if not mask.any(): return 0.0
+    if amounts[mask].sum()>0: return float((rates[mask]*amounts[mask]).sum()/amounts[mask].sum())
+    return float(rates[mask].mean())
 
 def commission_reconciliation(lines,settlements):
-    """Compare expected and actual commission only for order numbers present in BOTH APIs.
-    This prevents accounting-date differences from becoming false alarms."""
-    cols=["Sipariş No","Beklenen Komisyon","Gerçek Komisyon","Komisyon Farkı","Fark %","Durum"]
+    """Campaign-aware audit.
+    Order API commission is treated as the order/listing rate. Finance Sale commissionRate is treated as the applied rate when present.
+    CommissionNegative/Positive corrections are included, because Trendyol documents these as commission corrections.
+    """
+    cols=["Sipariş No","Barkod","Sipariş Oranı %","Uygulanan Oran %","Beklenen Komisyon","Satış Komisyonu","Komisyon Düzeltmesi","Gerçek Net Komisyon","Komisyon Avantajı","Fark TL","Durum"]
     if lines.empty or settlements.empty or "orderNumber" not in settlements.columns: return pd.DataFrame(columns=cols)
-    l=lines.copy(); l["Sipariş No"]=l["Sipariş No"].astype(str).str.strip(); l["Tahmini Komisyon"]=pd.to_numeric(l["Tahmini Komisyon"],errors="coerce").fillna(0.)
-    expected=l.groupby("Sipariş No",as_index=False)["Tahmini Komisyon"].sum().rename(columns={"Tahmini Komisyon":"Beklenen Komisyon"})
-    s=settlements.copy(); s["Sipariş No"]=s["orderNumber"].astype(str).str.strip(); s["commissionAmount"]=pd.to_numeric(s.get("commissionAmount",0.),errors="coerce").fillna(0.); typ=s.get("_sourceTransactionType",pd.Series("",index=s.index)).astype(str)
-    s["signed_commission"]=0.; s.loc[typ.eq("Sale"),"signed_commission"]=s.loc[typ.eq("Sale"),"commissionAmount"].abs(); s.loc[typ.eq("Return"),"signed_commission"]=-s.loc[typ.eq("Return"),"commissionAmount"].abs()
-    actual=s.groupby("Sipariş No",as_index=False)["signed_commission"].sum().rename(columns={"signed_commission":"Gerçek Komisyon"})
-    out=expected.merge(actual,on="Sipariş No",how="inner"); out=out[(out["Beklenen Komisyon"].abs()>0.01)|(out["Gerçek Komisyon"].abs()>0.01)].copy(); out["Komisyon Farkı"]=out["Gerçek Komisyon"]-out["Beklenen Komisyon"]; out["Fark %"]=out["Komisyon Farkı"]/out["Beklenen Komisyon"].replace(0,pd.NA)*100
-    out["Durum"]="🟢 Uyumlu"; out.loc[out["Fark %"].abs()>=0.5,"Durum"]="🟠 İncele"; out.loc[out["Fark %"].abs()>=2,"Durum"]="🔴 Fark"
-    return out.sort_values("Komisyon Farkı",key=lambda x:x.abs(),ascending=False)
+    l=lines.copy(); l["Sipariş No"]=l["Sipariş No"].astype(str).str.strip(); l["Barkod"]=l.get("Barkod","").astype(str).str.strip(); l["Tahmini Komisyon"]=pd.to_numeric(l["Tahmini Komisyon"],errors="coerce").fillna(0.); l["Sipariş Komisyon Oranı %"]=pd.to_numeric(l.get("Sipariş Komisyon Oranı %",0.),errors="coerce").fillna(0.)
+    keys=["Sipariş No","Barkod"]
+    order_ag=l.groupby(keys,as_index=False).agg({"Tahmini Komisyon":"sum","Sipariş Komisyon Oranı %":"mean"}).rename(columns={"Tahmini Komisyon":"Beklenen Komisyon","Sipariş Komisyon Oranı %":"Sipariş Oranı %"})
+    s=settlements.copy(); s["Sipariş No"]=s["orderNumber"].astype(str).str.strip(); s["Barkod"]=s.get("barcode","").astype(str).str.strip(); s["commissionAmount"]=pd.to_numeric(s.get("commissionAmount",0.),errors="coerce").fillna(0.); typ=s.get("_sourceTransactionType",pd.Series("",index=s.index)).astype(str)
+    s["signed_commission"]=0.0
+    sign_map={"Sale":1,"Return":-1,"CommissionPositive":1,"CommissionNegative":-1,"CommissionPositiveCancel":-1,"CommissionNegativeCancel":1}
+    for t,sgn in sign_map.items(): s.loc[typ.eq(t),"signed_commission"]=s.loc[typ.eq(t),"commissionAmount"].abs()*sgn
+    grouped=[]
+    for (order,barcode),g in s.groupby(keys,dropna=False):
+        gt=g.get("_sourceTransactionType",pd.Series("",index=g.index)).astype(str)
+        sale=g.loc[gt.eq("Sale"),"commissionAmount"].abs().sum(); corr=g.loc[~gt.isin(["Sale","Return"]),"signed_commission"].sum(); net=g["signed_commission"].sum(); rate=_weighted_rate(g.loc[gt.eq("Sale")])
+        grouped.append({"Sipariş No":order,"Barkod":barcode,"Satış Komisyonu":float(sale),"Komisyon Düzeltmesi":float(corr),"Gerçek Net Komisyon":float(net),"Uygulanan Oran %":rate})
+    actual=pd.DataFrame(grouped)
+    out=order_ag.merge(actual,on=keys,how="inner")
+    if out.empty: return pd.DataFrame(columns=cols)
+    out["Komisyon Avantajı"]=(out["Beklenen Komisyon"]-out["Gerçek Net Komisyon"]).clip(lower=0)
+    out["Fark TL"]=out["Gerçek Net Komisyon"]-out["Beklenen Komisyon"]
+    rate_drop=out["Sipariş Oranı %"]-out["Uygulanan Oran %"]
+    tolerance=out["Beklenen Komisyon"].abs().clip(lower=1)*0.005
+    out["Durum"]="🟢 Uyumlu"
+    campaign=(rate_drop>0.10) & (out["Gerçek Net Komisyon"]<=out["Beklenen Komisyon"]+tolerance)
+    correction=(out["Komisyon Düzeltmesi"]< -0.01) & (out["Gerçek Net Komisyon"]<=out["Beklenen Komisyon"]+tolerance)
+    out.loc[campaign|correction,"Durum"]="💚 İndirimli Komisyon / Avantaj"
+    over=out["Fark TL"]>tolerance
+    out.loc[over,"Durum"]="🔴 Fazla Komisyon?"
+    unexplained=(~campaign)&(~correction)&(~over)&(out["Fark TL"].abs()>tolerance)
+    out.loc[unexplained,"Durum"]="🟠 İncele"
+    return out[cols].sort_values(["Durum","Komisyon Avantajı","Fark TL"],ascending=[True,False,False]).reset_index(drop=True)
 
 def other_financial_summary(df):
     if df.empty:return {"debt":0.,"credit":0.,"net_deduction":0.}
