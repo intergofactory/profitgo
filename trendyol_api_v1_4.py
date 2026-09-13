@@ -70,9 +70,6 @@ def packages_to_lines(packages):
             td=float(line.get("lineTyDiscount") or 0)
             cr=float(line.get("commission") or line.get("commissionRate") or 0)
             vat=float(line.get("vatRate") or 0)
-            # Trendyol-funded discount must not reduce the seller-side commission base.
-            # Order V2 documents lineUnitPrice = gross - seller discount - TY discount;
-            # for commission expectation we therefore use gross - seller-funded discount.
             commission_base_unit=max(gross-sd,0.0)
             commission_base=commission_base_unit*q
             rows.append({"Sipariş No":order,"Paket ID":pid,"Sipariş Tarihi":od,"Sipariş Statüsü":status,"Model Kodu":str(line.get("stockCode") or line.get("merchantSku") or "").strip(),"Barkod":str(line.get("barcode") or "").strip(),"Ürün Adı":str(line.get("productName") or "").strip(),"Ürün Adedi":q,"Birim Brüt Fiyat":gross,"Birim Net Fiyat":unit,"Teslim Ciro":unit*q,"Satıcı İndirimi":sd*q,"Trendyol İndirimi":td*q,"Komisyon Matrahı":commission_base,"Sipariş Komisyon Oranı %":cr,"Tahmini Komisyon":commission_base*cr/100,"KDV Oranı %":vat,"Line ID":line.get("lineId"),"Satış Kampanyası ID":line.get("salesCampaignId"),"İndirim Kampanyaları":discount_names})
@@ -94,6 +91,57 @@ def fetch_other_financials(creds,start_date,end_date,transaction_type="Deduction
     p={"startDate":_to_ms(start_date),"endDate":_to_ms(end_date,True),"transactionType":transaction_type}
     if transaction_sub_type: p["transactionSubType"]=transaction_sub_type
     return pd.DataFrame(_paged_content(creds,f"/integration/finance/che/sellers/{creds.seller_id}/otherfinancials",p,size=1000,source_type=transaction_type))
+
+def fetch_cargo_invoice_items(creds, invoice_serial_number):
+    """Fetch item-level shipment/return cargo charges for one cargo invoice."""
+    serial=str(invoice_serial_number).strip()
+    if not serial:
+        return pd.DataFrame()
+    rows=_paged_content(creds,f"/integration/finance/che/sellers/{creds.seller_id}/cargo-invoice/{serial}/items",{},size=500,source_type="CargoInvoiceItem")
+    out=pd.DataFrame(rows)
+    if not out.empty:
+        out["invoiceSerialNumber"]=serial
+    return out
+
+def cargo_invoice_serials(deductions):
+    """Find cargo invoice serial numbers from DeductionInvoices rows.
+    Trendyol documents the row id as the invoiceSerialNumber for cargo invoice rows.
+    """
+    if deductions is None or deductions.empty or "id" not in deductions.columns:
+        return []
+    w=deductions.copy()
+    text=pd.Series("",index=w.index,dtype="object")
+    for c in ("transactionType","transactionSubType","description"):
+        if c in w.columns:
+            text=text.str.cat(w[c].fillna("").astype(str),sep=" ")
+    mask=text.str.contains("kargo|cargo",case=False,regex=True,na=False)
+    vals=w.loc[mask,"id"].dropna().astype(str).str.strip()
+    return [x for x in vals.drop_duplicates().tolist() if x]
+
+def fetch_cargo_details_from_deductions(creds,deductions):
+    """Resolve all cargo invoices in the deduction report to item-level cargo rows.
+    One bad/old invoice should not block the rest; errors are returned separately.
+    """
+    frames=[]; errors=[]
+    for serial in cargo_invoice_serials(deductions):
+        try:
+            df=fetch_cargo_invoice_items(creds,serial)
+            if not df.empty: frames.append(df)
+        except TrendyolApiError as exc:
+            errors.append({"invoiceSerialNumber":serial,"error":str(exc)})
+    details=pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
+    return details,pd.DataFrame(errors)
+
+def cargo_summary(df):
+    if df is None or df.empty:
+        return {"outbound":0.0,"return":0.0,"other":0.0,"total":0.0,"rows":0}
+    w=df.copy()
+    amount=pd.to_numeric(w["amount"] if "amount" in w else pd.Series(0.0,index=w.index),errors="coerce").fillna(0.0).abs()
+    typ=w["shipmentPackageType"].fillna("").astype(str) if "shipmentPackageType" in w else pd.Series("",index=w.index)
+    ret_mask=typ.str.contains("iade|return",case=False,regex=True,na=False)
+    out_mask=typ.str.contains("gönderi|gonderi|shipment|outbound",case=False,regex=True,na=False) & ~ret_mask
+    outbound=float(amount[out_mask].sum()); returned=float(amount[ret_mask].sum()); total=float(amount.sum())
+    return {"outbound":outbound,"return":returned,"other":max(total-outbound-returned,0.0),"total":total,"rows":int(len(w))}
 
 def settlement_summary(df):
     if df.empty: return {"seller_revenue_net":0.,"commission_net":0.,"sales_revenue":0.,"return_revenue":0.,"sale_commission":0.,"return_commission":0.,"commission_credit":0.,"commission_debit":0.}
@@ -144,7 +192,7 @@ def commission_reconciliation(lines,settlements):
     correction=(out["Komisyon Düzeltmesi"]< -0.01) & (out["Gerçek Net Komisyon"]<=out["Beklenen Komisyon"]+tolerance)
     out.loc[campaign|correction,"Durum"]="💚 İndirimli Komisyon / Avantaj"
     over=out["Fark TL"]>tolerance
-    out.loc[over,"Durum"]="🔴 Fazla Komisyon?"
+    out.loc[over,"Durum"]="🟠 Açıklanamayan Fark"
     unexplained=(~campaign)&(~correction)&(~over)&(out["Fark TL"].abs()>tolerance)
     out.loc[unexplained,"Durum"]="🟠 İncele"
     return out[cols].sort_values(["Durum","Komisyon Avantajı","Fark TL"],ascending=[True,False,False]).reset_index(drop=True)
