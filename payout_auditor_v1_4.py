@@ -1,21 +1,39 @@
 from __future__ import annotations
 import pandas as pd
 
+# Trendyol'un hakediş dokümanındaki sellerRevenue yönleri.
+# Sale/pozitif kayıtlar alacak; Return/indirim/negatif kayıtlar borç etkisidir.
+SETTLEMENT_SIGN={
+ 'Sale':1,'Return':-1,'Discount':-1,'DiscountCancel':1,'Coupon':-1,'CouponCancel':1,
+ 'ProvisionPositive':1,'ProvisionNegative':-1,'TYDiscount':-1,'TYDiscountCancel':1,
+ 'TYCoupon':-1,'TYCouponCancel':1,'ManuelRefund':-1,'ManuelRefundCancel':1,
+ 'SellerRevenuePositive':1,'SellerRevenueNegative':-1,
+ 'SellerRevenuePositiveCancel':-1,'SellerRevenueNegativeCancel':1,
+}
+COMMISSION_SIGN={
+ 'CommissionPositive':-1,'CommissionNegative':1,
+ 'CommissionPositiveCancel':1,'CommissionNegativeCancel':-1,
+}
+
 def _n(s): return pd.to_numeric(s,errors='coerce').fillna(0.0)
 
 def settlement_effect(df):
-    """Current-account effect of settlement rows.
+    """Hakedişe giren settlement etkisini Trendyol'un belgelenmiş alanlarından üretir.
 
-    Hakediş mutabakatında sellerRevenue değil cari hesap debt/credit hareketi
-    kullanılmalıdır. Örn. Sale satırında credit, sellerRevenue + commission
-    bileşenlerini taşıyabilir; ilgili komisyon/fatura borçları cari hesapta ayrıca
-    kapanır. Bu nedenle payment-order ile aynı muhasebe ekseninde credit-debt
-    kullanıyoruz.
+    Sale gibi satırlarda credit brüt cari hareket olabilir; hakedişe esas net değer
+    sellerRevenue'dur. Saf komisyon düzeltmelerinde sellerRevenue=0 olduğu için
+    commissionAmount belgelenmiş yönüyle kullanılır.
     """
     if df is None or df.empty:return 0.0,pd.DataFrame()
-    w=df.copy(); debt=_n(w.get('debt',pd.Series(0,index=w.index))); credit=_n(w.get('credit',pd.Series(0,index=w.index)))
-    w['Etki']=credit-debt
-    w['Tür']=w.get('_sourceTransactionType',w.get('transactionType',pd.Series('',index=w.index))).astype(str)
+    w=df.copy(); typ=w.get('_sourceTransactionType',w.get('transactionType',pd.Series('',index=w.index))).astype(str)
+    rev=_n(w.get('sellerRevenue',pd.Series(0,index=w.index)))
+    comm=_n(w.get('commissionAmount',pd.Series(0,index=w.index))).abs()
+    w['Etki']=0.0
+    for t,sgn in SETTLEMENT_SIGN.items():
+        m=typ.eq(t); w.loc[m,'Etki']=rev.loc[m].abs()*sgn
+    for t,sgn in COMMISSION_SIGN.items():
+        m=typ.eq(t); w.loc[m,'Etki']=comm.loc[m]*sgn
+    w['Tür']=typ
     return float(w['Etki'].sum()),w
 
 def other_effect(df):
@@ -23,8 +41,7 @@ def other_effect(df):
     w=df.copy(); debt=_n(w.get('debt',pd.Series(0,index=w.index))); credit=_n(w.get('credit',pd.Series(0,index=w.index)))
     w['Tür']=w.get('_sourceTransactionType',w.get('transactionType',pd.Series('',index=w.index))).astype(str)
     w['Etki']=credit-debt
-    # PaymentOrder is the clearing/payment entry itself. Including it in the
-    # pre-payment balance would subtract the payout a second time.
+    # PaymentOrder ödeme/kapatma kaydının kendisidir; hakedişi oluştururken tekrar düşülmez.
     pre=w.loc[~w['Tür'].eq('PaymentOrder')].copy()
     return float(pre['Etki'].sum()),w
 
