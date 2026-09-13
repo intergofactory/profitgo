@@ -14,14 +14,41 @@ st.markdown('''<style>:root{--bg:#f4f7fb;--ink:#0b1220;--line:#e5eaf0}[data-test
 def money(v):
  return f"{v:,.2f} TL".replace(",","X").replace(".",",").replace("X",".")
 
+def classify_deductions(df):
+ """Classify DeductionInvoices conservatively from API text fields.
+ Unknown descriptions stay unknown; ProfitGO never guesses them into a financial bucket.
+ """
+ if df is None or df.empty:
+  return pd.DataFrame(columns=["Kategori","Tutar","Kayıt"]),pd.DataFrame()
+ w=df.copy()
+ debt=pd.to_numeric(w["debt"] if "debt" in w else pd.Series(0.0,index=w.index),errors="coerce").fillna(0.0)
+ credit=pd.to_numeric(w["credit"] if "credit" in w else pd.Series(0.0,index=w.index),errors="coerce").fillna(0.0)
+ w["Net Tutar"]=debt-credit
+ text=pd.Series("",index=w.index,dtype="object")
+ for col in ("transactionType","transactionSubType","description","invoiceType"):
+  if col in w.columns:
+   text=text.str.cat(w[col].fillna("").astype(str),sep=" ")
+ t=text.str.lower()
+ w["Kategori"]="Diğer / Tanımsız Fatura"
+ w.loc[t.str.contains("platformservice|platform hizmet",regex=True,na=False),"Kategori"]="Platform Hizmet Bedeli"
+ w.loc[t.str.contains("kargo|cargo",regex=True,na=False),"Kategori"]="Kargo Faturası"
+ w.loc[t.str.contains("ceza|penalty|ihlal",regex=True,na=False),"Kategori"]="Ceza / İhlal"
+ w.loc[t.str.contains("reklam|advert|sponsor|pazarlama",regex=True,na=False),"Kategori"]="Reklam / Pazarlama"
+ service_mask=t.str.contains("operasyon|operation|hizmet|service|servis|teknolojik|altyapı|altyapi",regex=True,na=False)
+ w.loc[service_mask & w["Kategori"].eq("Diğer / Tanımsız Fatura"),"Kategori"]="Diğer Hizmet / Operasyon"
+ summary=w.groupby("Kategori",as_index=False).agg(Tutar=("Net Tutar","sum"),Kayıt=("Net Tutar","size"))
+ summary["Mutlak Tutar"]=summary["Tutar"].abs()
+ summary=summary.sort_values("Mutlak Tutar",ascending=False).drop(columns="Mutlak Tutar")
+ return summary,w
+
 with st.sidebar:
  st.markdown("## ProfitGO")
  st.caption("V1.4 • API Finance Development")
  st.divider()
  st.write("**Komisyon + Kesinti Motoru**")
- st.caption("Order API + Finance API + Platform + Kargo")
+ st.caption("Order API + Finance API + Platform + Kargo + Kesinti Sınıfları")
 
-st.markdown('''<div class="pg-hero"><div>PROFITGO V1.4 • FINANCE ENGINE</div><h1>Kesintiyi <em>kalem kalem</em> ayır.</h1><p>Komisyon, platform hizmet bedeli, gönderi kargo ve iade kargo birbirinden ayrılır. Açıklanamayan tutar ancak bu katmanlardan sonra anomali adayı olur.</p></div>''',unsafe_allow_html=True)
+st.markdown('''<div class="pg-hero"><div>PROFITGO V1.4 • FINANCE ENGINE</div><h1>Kesintiyi <em>kalem kalem</em> ayır.</h1><p>Komisyon, platform hizmet bedeli, kargo, ceza ve diğer fatura türleri birbirinden ayrılır. Tanımlanamayan kayıtlar ayrıca gösterilir; tahmin edilerek yanlış kategoriye atılmaz.</p></div>''',unsafe_allow_html=True)
 
 try:
  seller_id=int(st.secrets["TRENDYOL_SELLER_ID"])
@@ -94,6 +121,8 @@ ded=ty.other_financial_summary(deductions)
 pf=ty.other_financial_summary(platform_fees)
 cargo=ty.cargo_summary(cargo_details)
 audit=ty.commission_reconciliation(lines,settlements)
+deduction_map,deduction_rows=classify_deductions(deductions)
+
 matched_expected=float(audit["Beklenen Komisyon"].sum()) if not audit.empty else 0.0
 matched_actual=float(audit["Gerçek Net Komisyon"].sum()) if not audit.empty else 0.0
 advantage=float(audit["Komisyon Avantajı"].sum()) if not audit.empty else 0.0
@@ -104,6 +133,16 @@ unexplained_count=int(unexplained_mask.sum()) if not audit.empty else 0
 platform_fee=pf["net_deduction"]
 cargo_total=cargo["total"]
 residual_after_known=ded["net_deduction"]-platform_fee-cargo_total
+
+def category_value(name):
+ if deduction_map.empty: return 0.0
+ s=deduction_map.loc[deduction_map["Kategori"].eq(name),"Tutar"]
+ return float(s.sum()) if not s.empty else 0.0
+
+penalty_total=category_value("Ceza / İhlal")
+ad_total=category_value("Reklam / Pazarlama")
+service_total=category_value("Diğer Hizmet / Operasyon")
+unknown_total=category_value("Diğer / Tanımsız Fatura")
 
 st.markdown('<div class="pg-card"><div class="pg-eyebrow">KESİNTİ HARİTASI</div><h3>Platform ve kargoyu ayrı hesapla</h3><p>Platform Hizmet Bedeli ile kargo faturaları komisyon değildir. ProfitGO bunları Net Kesinti/Fatura toplamından ayrı katmanlar halinde gösterir.</p></div>',unsafe_allow_html=True)
 k1,k2,k3,k4=st.columns(4)
@@ -124,6 +163,19 @@ elif not cargo_errors.empty:
  st.warning("Kargo fatura detaylarında bazı kayıtlar çözülemedi; ham hata bilgisi aşağıdaki teknik bölümde tutuldu.")
 else:
  st.info("Bu tarih aralığındaki DeductionInvoices kayıtlarında çözülebilir kargo faturası bulunmadı.")
+
+st.markdown('<div class="pg-card"><div class="pg-eyebrow">DİĞER KESİNTİLER</div><h3>Kalan faturaları açıklama metnine göre sınıflandır</h3><p>Ceza, reklam ve operasyon/hizmet kayıtları yalnızca API açıklamasında açık sinyal varsa sınıflandırılır. Eşleşmeyen kayıtlar Tanımsız bırakılır.</p></div>',unsafe_allow_html=True)
+d1,d2,d3,d4=st.columns(4)
+d1.metric("Ceza / İhlal",money(penalty_total))
+d2.metric("Reklam / Pazarlama",money(ad_total))
+d3.metric("Diğer Hizmet / Operasyon",money(service_total))
+d4.metric("Tanımsız Fatura",money(unknown_total))
+if not deduction_map.empty:
+ st.dataframe(deduction_map,width="stretch",hide_index=True,column_config={"Tutar":st.column_config.NumberColumn(format="%.2f TL"),"Kayıt":st.column_config.NumberColumn(format="%d")})
+ if abs(float(deduction_map["Tutar"].sum())-ded["net_deduction"])<0.05:
+  st.success("Kesinti sınıfları toplamı Net Kesinti/Fatura toplamıyla mutabık.")
+ else:
+  st.warning("Kesinti sınıfları ile Net Kesinti/Fatura arasında mutabakat farkı var; bu fark ayrıca incelenmeli.")
 
 st.markdown('<div class="pg-card"><div class="pg-eyebrow">KAMPANYA / TARİFE MOTORU</div><h3>İndirimli komisyonu anomali sanma</h3><p>Finance API komisyon oranı sipariş oranından düşükse veya CommissionNegative düzeltmesi varsa avantaj olarak ayrılır. Pozitif farklar ise henüz açıklanamayan fark olarak tutulur; fazla kesinti diye kesinleştirilmez.</p></div>',unsafe_allow_html=True)
 k1,k2,k3,k4=st.columns(4)
@@ -150,7 +202,7 @@ with st.expander("💚 Komisyon kampanyası / tarife denetçisi",expanded=True):
  else:
   st.dataframe(audit,width="stretch",hide_index=True,column_config={"Sipariş Oranı %":st.column_config.NumberColumn(format="%.2f%%"),"Uygulanan Oran %":st.column_config.NumberColumn(format="%.2f%%"),"Komisyon Matrahı":st.column_config.NumberColumn(format="%.2f TL"),"Beklenen Komisyon":st.column_config.NumberColumn(format="%.2f TL"),"Satış Komisyonu":st.column_config.NumberColumn(format="%.2f TL"),"Komisyon Düzeltmesi":st.column_config.NumberColumn(format="%.2f TL"),"Gerçek Net Komisyon":st.column_config.NumberColumn(format="%.2f TL"),"Komisyon Avantajı":st.column_config.NumberColumn(format="%.2f TL"),"Fark TL":st.column_config.NumberColumn(format="%.2f TL")})
 
-with st.expander("🚚 Kargo fatura detayları",expanded=True):
+with st.expander("🚚 Kargo fatura detayları"):
  if cargo_details.empty:
   st.info("Kargo detay kaydı yok.")
  else:
@@ -160,15 +212,19 @@ with st.expander("🚚 Kargo fatura detayları",expanded=True):
   else:
    st.dataframe(cargo_details,width="stretch",hide_index=True)
 
+with st.expander("🧾 Sınıflandırılmış kesinti/fatura kayıtları",expanded=True):
+ if deduction_rows.empty:
+  st.info("Kesinti kaydı yok.")
+ else:
+  cols=[c for c in ["Kategori","transactionDate","transactionType","transactionSubType","description","Net Tutar","debt","credit","id"] if c in deduction_rows.columns]
+  st.dataframe(deduction_rows[cols] if cols else deduction_rows,width="stretch",hide_index=True,column_config={"Net Tutar":st.column_config.NumberColumn(format="%.2f TL")})
+
 with st.expander("🧾 Platform hizmet bedeli kayıtları"):
  if platform_fees.empty:
   st.info("PlatformServiceFee filtresiyle kayıt dönmedi.")
  else:
   cols=[c for c in ["transactionDate","transactionType","transactionSubType","description","debt","credit","id","paymentOrderId"] if c in platform_fees.columns]
-  if cols:
-   st.dataframe(platform_fees[cols],width="stretch",hide_index=True)
-  else:
-   st.dataframe(platform_fees,width="stretch",hide_index=True)
+  st.dataframe(platform_fees[cols] if cols else platform_fees,width="stretch",hide_index=True)
 
 with st.expander("Finans hareketleri"):
  cols=[c for c in ["transactionDate","_sourceTransactionType","orderNumber","barcode","shipmentPackageId","sellerRevenue","commissionRate","commissionAmount","debt","credit"] if c in settlements.columns]
@@ -176,13 +232,6 @@ with st.expander("Finans hareketleri"):
   st.dataframe(settlements[cols],width="stretch",hide_index=True)
  else:
   st.info("Finans hareketi yok.")
-
-with st.expander("Tüm kesinti / fatura hareketleri"):
- cols=[c for c in ["transactionDate","transactionType","transactionSubType","description","debt","credit","id","paymentOrderId"] if c in deductions.columns]
- if cols:
-  st.dataframe(deductions[cols],width="stretch",hide_index=True)
- else:
-  st.info("Kesinti hareketi yok.")
 
 if not cargo_errors.empty:
  with st.expander("Teknik: çözülemeyen kargo faturaları"):
