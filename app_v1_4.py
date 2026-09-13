@@ -4,13 +4,13 @@ import importlib
 import pandas as pd
 import streamlit as st
 import trendyol_api_v1_4 as ty
-ty=importlib.reload(ty); TrendyolCredentials=ty.TrendyolCredentials; TrendyolApiError=ty.TrendyolApiError
+ty=importlib.reload(ty); TrendyolCredentials=ty.TrendyolCredentials
 st.set_page_config(page_title="ProfitGO V1.4 - API Finans Merkezi",page_icon="◈",layout="wide",initial_sidebar_state="expanded")
 st.markdown('''<style>:root{--bg:#f4f7fb;--ink:#0b1220;--line:#e5eaf0}[data-testid="stAppViewContainer"]{background:var(--bg);color:var(--ink)}.block-container{max-width:1500px;padding-top:1.4rem;padding-bottom:4rem}[data-testid="stSidebar"]{background:#0b1220}[data-testid="stSidebar"] *{color:#e2e8f0}.pg-card{background:#fff;border:1px solid var(--line);border-radius:18px;padding:20px;margin-bottom:14px}.pg-eyebrow{font-size:9px;font-weight:800;color:#059669;letter-spacing:.13em}.pg-hero{background:linear-gradient(125deg,#09111f,#101b30 62%,#073d32);border-radius:24px;padding:32px 38px;color:#fff;margin-bottom:16px}.pg-hero h1{color:#fff;font-size:38px}.pg-hero em{font-style:normal;color:#6ee7b7}[data-testid="stMetric"],[data-testid="stDataFrame"]{background:#fff;border:1px solid var(--line);border-radius:14px;padding:10px}</style>''',unsafe_allow_html=True)
 def money(v): return f"{v:,.2f} TL".replace(",","X").replace(".",",").replace("X",".")
 with st.sidebar:
- st.markdown("## ProfitGO"); st.caption("V1.4 • API Finance Development"); st.divider(); st.write("**Trendyol API Merkezi**"); st.caption("Sipariş + Cari Hesap + sipariş bazlı mutabakat")
-st.markdown('''<div class="pg-hero"><div>PROFITGO V1.4 • API FINANCE</div><h1>Satışı değil, <em>gerçek finansal sonucu</em> gör.</h1><p>Order API ve Finance API aynı sipariş numarası üzerinde eşleştirilir. Dönem farkları artık doğrudan komisyon alarmı üretmez.</p></div>''',unsafe_allow_html=True)
+ st.markdown("## ProfitGO"); st.caption("V1.4 • API Finance Development"); st.divider(); st.write("**Komisyon Tarife Motoru**"); st.caption("Order API + Finance API + komisyon düzeltmeleri")
+st.markdown('''<div class="pg-hero"><div>PROFITGO V1.4 • COMMISSION ENGINE</div><h1>Komisyon farkını <em>avantaj mı hata mı</em> diye ayır.</h1><p>Siparişte görünen komisyon oranı, Finance API'de gerçekten uygulanan oran ve komisyon düzeltmeleri birlikte okunur. İndirimli komisyon artık hata olarak işaretlenmez.</p></div>''',unsafe_allow_html=True)
 try:
  seller_id=int(st.secrets["TRENDYOL_SELLER_ID"]); creds=TrendyolCredentials(seller_id,str(st.secrets["TRENDYOL_API_KEY"]),str(st.secrets["TRENDYOL_API_SECRET"]),str(st.secrets.get("TRENDYOL_USER_AGENT",f"{seller_id} - ProfitGO")))
 except Exception: st.error("Trendyol API bağlantısı yapılandırılmadı."); st.stop()
@@ -22,7 +22,7 @@ if (end_date-start_date).days>14: st.warning("15 gün veya daha kısa bir aralı
 if st.button("Trendyol'dan sipariş + finans verilerini çek",type="primary",width="stretch"):
  try:
   with st.spinner("Siparişler alınıyor..."): packages=ty.fetch_order_packages(creds,start_date,end_date); lines=ty.packages_to_lines(packages)
-  with st.spinner("Cari hesap hareketleri alınıyor..."): settlements=ty.fetch_settlements(creds,start_date,end_date)
+  with st.spinner("Cari hesap ve komisyon hareketleri alınıyor..."): settlements=ty.fetch_settlements(creds,start_date,end_date)
   with st.spinner("Kesinti/fatura hareketleri alınıyor..."): deductions=ty.fetch_other_financials(creds,start_date,end_date,"DeductionInvoices")
   st.session_state.v14_api_lines=lines; st.session_state.v14_finance_settlements=settlements; st.session_state.v14_finance_deductions=deductions
   st.success(f"{len(packages):,} paket • {len(lines):,} ürün satırı • {len(settlements):,} finans hareketi • {len(deductions):,} kesinti hareketi".replace(",","."))
@@ -32,19 +32,18 @@ lines=st.session_state.v14_api_lines.copy(); settlements=st.session_state.get("v
 if lines.empty: st.info("Sipariş bulunamadı."); st.stop()
 revenue=float(pd.to_numeric(lines["Teslim Ciro"],errors="coerce").fillna(0).sum()); estimated=float(pd.to_numeric(lines["Tahmini Komisyon"],errors="coerce").fillna(0).sum()); seller_discount=float(pd.to_numeric(lines["Satıcı İndirimi"],errors="coerce").fillna(0).sum()); ty_discount=float(pd.to_numeric(lines["Trendyol İndirimi"],errors="coerce").fillna(0).sum())
 fin=ty.settlement_summary(settlements); ded=ty.other_financial_summary(deductions); audit=ty.commission_reconciliation(lines,settlements)
-matched_expected=float(audit["Beklenen Komisyon"].sum()) if not audit.empty else 0.; matched_actual=float(audit["Gerçek Komisyon"].sum()) if not audit.empty else 0.; matched_diff=matched_actual-matched_expected; matched_pct=matched_diff/matched_expected*100 if matched_expected else 0.; flagged=int(audit["Durum"].ne("🟢 Uyumlu").sum()) if not audit.empty else 0
-st.markdown('<div class="pg-card"><div class="pg-eyebrow">SİPARİŞ BAZLI MUTABAKAT</div><h3>Aynı siparişi aynı siparişle karşılaştırıyoruz</h3><p>Genel dönem toplamları farklı muhasebeleşme tarihleri içerebilir. Alarm yalnızca hem Order API hem Finance API tarafında bulunan siparişler üzerinden üretilir.</p></div>',unsafe_allow_html=True)
-k1,k2,k3,k4=st.columns(4); k1.metric("Sipariş Ürün Cirosu",money(revenue)); k2.metric("Eşleşen Beklenen Komisyon",money(matched_expected)); k3.metric("Eşleşen Gerçek Komisyon",money(matched_actual),f"Fark {money(matched_diff)}"); k4.metric("Net Kesinti/Fatura",money(ded["net_deduction"]))
-if not audit.empty:
- if abs(matched_pct)<.5 and flagged==0: st.success(f"Sipariş bazlı komisyon mutabakatı güçlü • Toplam fark %{matched_pct:.2f} • İncelenecek sipariş yok.")
- else: st.warning(f"Sipariş bazlı toplam fark %{matched_pct:.2f} • {flagged} sipariş incelemeye ayrıldı. Bu alarm yalnızca eşleşen siparişlerden hesaplandı.")
-else: st.info("Bu tarih aralığında Order ve Finance API arasında sipariş numarasıyla eşleşen komisyon hareketi bulunamadı.")
-a,b,c,d=st.columns(4); a.metric("Dönem Tahmini Komisyon",money(estimated)); b.metric("Dönem Satış Komisyonu",money(fin["sale_commission"])); c.metric("İade Komisyon İptali",money(fin["return_commission"])); d.metric("Cari Hesap Net Geliri",money(fin["seller_revenue_net"]))
-st.caption("Dönem toplamları bilgi amaçlıdır; muhasebeleşme tarihi farkı nedeniyle doğrudan alarm üretmez. Trendyol indirimi: "+money(ty_discount)+" • Satıcı indirimi: "+money(seller_discount))
-with st.expander("🔎 Sipariş bazlı komisyon denetçisi",expanded=True):
+matched_expected=float(audit["Beklenen Komisyon"].sum()) if not audit.empty else 0.; matched_actual=float(audit["Gerçek Net Komisyon"].sum()) if not audit.empty else 0.; advantage=float(audit["Komisyon Avantajı"].sum()) if not audit.empty else 0.; potential_over=float(audit.loc[audit["Durum"].eq("🔴 Fazla Komisyon?"),"Fark TL"].clip(lower=0).sum()) if not audit.empty else 0.; campaign_count=int(audit["Durum"].eq("💚 İndirimli Komisyon / Avantaj").sum()) if not audit.empty else 0; over_count=int(audit["Durum"].eq("🔴 Fazla Komisyon?").sum()) if not audit.empty else 0
+st.markdown('<div class="pg-card"><div class="pg-eyebrow">KAMPANYA / TARİFE MOTORU</div><h3>İndirimli komisyonu anomali sanma</h3><p>Finance API komisyon oranı sipariş oranından düşükse veya CommissionNegative düzeltmesi varsa bu kayıt avantaj olarak ayrılır. Yalnızca gerçekleşen net komisyon beklenenden yüksekse fazla komisyon adayı oluşturulur.</p></div>',unsafe_allow_html=True)
+k1,k2,k3,k4=st.columns(4); k1.metric("Eşleşen Beklenen",money(matched_expected)); k2.metric("Eşleşen Gerçek",money(matched_actual)); k3.metric("Komisyon Avantajı",money(advantage),f"{campaign_count} satır"); k4.metric("Fazla Komisyon Adayı",money(potential_over),f"{over_count} satır")
+if campaign_count: st.success(f"{campaign_count} sipariş/ürün satırında indirimli komisyon veya komisyon iadesi/düzeltmesi sinyali bulundu. Toplam avantaj: {money(advantage)}")
+if over_count: st.error(f"{over_count} satırda gerçekleşen net komisyon beklenen komisyonu aşıyor. Toplam potansiyel fazla komisyon: {money(potential_over)}")
+elif not audit.empty: st.info("Eşleşen kayıtlarda beklenenden yüksek net komisyon adayı görünmüyor.")
+a,b,c,d=st.columns(4); a.metric("Dönem Tahmini Komisyon",money(estimated)); b.metric("Satış Komisyonu",money(fin["sale_commission"])); c.metric("Komisyon İade/Düzeltme Kredisi",money(fin["return_commission"]+fin.get("commission_credit",0))); d.metric("Net Kesinti/Fatura",money(ded["net_deduction"]))
+st.caption("Dönem toplamları bilgi amaçlıdır. Alarm motoru yalnızca Order ve Finance API'de aynı sipariş+barkod eşleşen kayıtları kullanır. Trendyol indirimi: "+money(ty_discount)+" • Satıcı indirimi: "+money(seller_discount))
+with st.expander("💚 Komisyon kampanyası / tarife denetçisi",expanded=True):
  if audit.empty: st.info("Eşleşen kayıt yok.")
  else:
-  st.dataframe(audit,width="stretch",hide_index=True,column_config={"Beklenen Komisyon":st.column_config.NumberColumn(format="%.2f TL"),"Gerçek Komisyon":st.column_config.NumberColumn(format="%.2f TL"),"Komisyon Farkı":st.column_config.NumberColumn(format="%.2f TL"),"Fark %":st.column_config.NumberColumn(format="%.2f%%")})
+  st.dataframe(audit,width="stretch",hide_index=True,column_config={"Sipariş Oranı %":st.column_config.NumberColumn(format="%.2f%%"),"Uygulanan Oran %":st.column_config.NumberColumn(format="%.2f%%"),"Beklenen Komisyon":st.column_config.NumberColumn(format="%.2f TL"),"Satış Komisyonu":st.column_config.NumberColumn(format="%.2f TL"),"Komisyon Düzeltmesi":st.column_config.NumberColumn(format="%.2f TL"),"Gerçek Net Komisyon":st.column_config.NumberColumn(format="%.2f TL"),"Komisyon Avantajı":st.column_config.NumberColumn(format="%.2f TL"),"Fark TL":st.column_config.NumberColumn(format="%.2f TL")})
 with st.expander("Finans hareketleri"):
  cols=[c for c in ["transactionDate","_sourceTransactionType","orderNumber","barcode","sellerRevenue","commissionRate","commissionAmount","debt","credit"] if c in settlements.columns]; st.dataframe(settlements[cols],width="stretch",hide_index=True) if cols else st.info("Finans hareketi yok.")
 with st.expander("Kesinti / fatura hareketleri"):
